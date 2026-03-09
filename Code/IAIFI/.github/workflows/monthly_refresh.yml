@@ -1,0 +1,35 @@
+# DEP.2: Monthly Paperscape Refresh
+# Reruns the full pipeline on the first of each month and deploys updated data.
+
+name: Monthly Paperscape Refresh
+
+on:
+  schedule:
+    - cron: '0 6 1 * *'    # First of each month, 6 AM UTC
+  workflow_dispatch:         # Manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - run: bash run_pipeline.sh
+
+      - name: Compute DATA_VERSION
+        run: |
+          echo "DATA_VERSION=$(date +%Y-%m-%d)_$(sha256sum web/data/papers.json | head -c 8)_n$(jq '.meta.n_total' web/data/papers.json)" >> $GITHUB_ENV
+
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./web

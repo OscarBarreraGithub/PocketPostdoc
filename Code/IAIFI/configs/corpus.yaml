@@ -1,0 +1,50 @@
+iaifi:
+  seed_file: data/external/iaifi_papers.csv
+  # columns: arxiv_id, title, authors, published, iaifi_theme (optional)
+
+background:
+  start_date: "2018-01-01"   # captures modern ML-physics wave; IAIFI founded 2020
+  end_date: null              # null = today
+  date_field: submittedDate   # use submittedDate for corpus boundaries; see Step B note
+  query_time_utc: "0000"      # arXiv API expects YYYYMMDDHHMM (GMT)
+  sort_by: submittedDate      # explicit ordering for deterministic pagination
+  sort_order: descending      # newest-first under per-category cap
+  candidate_cap: 30000        # max papers in candidate pool
+  # Canonical processing order. Crosslist dedup is first-seen-wins in this order.
+  categories:
+    - hep-th
+    - hep-ph
+    - cs.LG
+    - cs.AI
+    - stat.ML
+    - astro-ph.CO
+    - astro-ph.HE
+    - astro-ph.GA
+    - astro-ph.IM
+    - gr-qc
+    - nucl-th
+    - cond-mat.stat-mech
+  per_category_cap: 4000      # prevent any single category from dominating
+  rate_limit_seconds: 3       # arXiv API rate limit
+  user_agent: "iaifi-paperscape/2.1 (+mailto:maintainer@example.org)"
+  timeout_seconds: 30
+  max_retries: 5
+  network_retry_base_seconds: 1.0
+  retry_statuses: [429, 500, 502, 503, 504]
+  max_results_per_page: 2000  # arXiv pagination limit
+
+selection:
+  method: knn_union            # kNN union from each IAIFI paper
+  knn_initial_k: 100           # initial recall pool per IAIFI seed before diversity filter
+  space: embedding_768d        # operate in full embedding space, NOT PCA-reduced
+  diversity:
+    enabled: true
+    per_seed_diverse_k: 12     # keep up to 12 non-redundant neighbors per IAIFI seed
+    near_duplicate_cosine: 0.985
+    anti_hub_weight: 0.2       # mild regularizer; high values can favor rare but irrelevant papers
+  target_background: 8000      # target after kNN union + dedup
+  max_background: 10000        # hard cap
+  bridge_ballast: 1000         # uniform random sample for cartographic continuity
+  hubness_monitor:
+    warn_if_neighbor_share_gt: 0.15
+    optional_hard_cap_share: null   # set, e.g., 0.30, only if method hubs hurt UX

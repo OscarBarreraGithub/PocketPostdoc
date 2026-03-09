@@ -1,0 +1,7 @@
+# This seed file must be reviewed and fully populated with the canonical IAIFI paper list before production runs.
+arxiv_id,title,authors,published,iaifi_theme
+2010.01127,Example IAIFI seed paper,Populate from arXiv metadata,2020-10-01,AI
+2012.04604,Example IAIFI seed paper,Populate from arXiv metadata,2020-12-01,Physics
+2104.01725,Example IAIFI seed paper,Populate from arXiv metadata,2021-04-01,Both
+2106.09024,Example IAIFI seed paper,Populate from arXiv metadata,2021-06-01,AI
+2201.03568,Example IAIFI seed paper,Populate from arXiv metadata,2022-01-01,Physics

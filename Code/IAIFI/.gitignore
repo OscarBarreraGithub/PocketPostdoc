@@ -1,0 +1,19 @@
+# Ignore generated data artifacts; keep checked-in external data.
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/arxiv_api/
+data/raw/arxiv_api/*
+!data/raw/arxiv_api/.gitkeep
+
+data/interim/*
+!data/interim/.gitkeep
+
+data/processed/*
+!data/processed/.gitkeep
+
+data/models/*
+!data/models/.gitkeep
+
+# Ignore exploratory notebooks.
+notebooks/*
+!notebooks/.gitkeep

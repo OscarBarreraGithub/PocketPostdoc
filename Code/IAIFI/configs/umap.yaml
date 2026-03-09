@@ -1,0 +1,21 @@
+pca:
+  n_components: 50             # denoising + speed
+  whiten: false
+
+umap:
+  n_neighbors: 40              # broader than default 15; captures sub-field structure
+  min_dist: 0.08               # moderate: avoids over-clumping
+  n_components: 2
+  metric: cosine
+  random_state: 42
+  # Note: standard UMAP default. Test densMAP but do not default to it.
+  # densmap: false
+
+update:
+  incremental:
+    enabled: true
+    method: transform           # UMAP .transform() for adding few new papers
+  monthly_refit:
+    enabled: true
+    procrustes_anchors: iaifi   # use IAIFI papers as anchor points
+    save_previous: true         # keep previous coords for comparison

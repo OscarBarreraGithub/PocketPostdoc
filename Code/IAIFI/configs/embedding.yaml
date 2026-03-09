@@ -1,0 +1,21 @@
+model:
+  base: allenai/specter2_base
+  adapter: allenai/specter2_proximity
+  adapter_source: hf
+input:
+  format: "title + [SEP] + abstract"
+  max_tokens: 512
+output:
+  dimensions: 768
+  normalize: l2                # L2-normalize all output vectors
+compute:
+  batch_size: 32
+  device: cpu                  # GPU optional, CPU sufficient for <30K
+  cache_path: data/interim/embeddings.npy
+quality:
+  sanity_check_count: 20       # random IAIFI papers to spot-check
+  sanity_check_k: 10           # check top-k neighbors for each
+  monitor_hubness: true
+  track_truncation_rate: true
+  truncation_warn_fraction: 0.15
+  metadata_prefix_experiment: false  # OFF by default; enable only for controlled A/B tests

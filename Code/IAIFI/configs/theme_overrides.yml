@@ -1,0 +1,11 @@
+# Human-curated cluster labels. MANDATORY before deployment.
+# Format: cluster_id -> display label
+# Auto-generated candidates are in data/processed/cluster_labels.json
+#
+# Example:
+# 0: "Lattice QCD & Gauge Theory"
+# 1: "Deep Generative Models"
+# 2: "Gravitational Wave Detection"
+# ...
+#
+# This file MUST be reviewed and populated before shipping.
