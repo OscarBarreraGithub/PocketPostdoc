@@ -1,8 +1,8 @@
-# IAIFI Paperscape v1.5 — Implementation Plan
+# IAIFI Paperscape v2 — Implementation Plan
 
-**Version:** 1.5 (Final)
+**Version:** 2.0 (Final)
 **Date:** 2026-03-09
-**Status:** Approved by Claude + Codex cross-review
+**Status:** Approved by Claude + Codex cross-review (v2 update)
 
 ---
 
@@ -12,7 +12,7 @@ These four properties define "done." If any fails, the project has not shipped.
 
 1. **Usable at zoomed-out view.** IAIFI concentrations are visible against the background without a grey snowstorm obscuring structure. Background points recede; IAIFI points pop.
 2. **Actionable on click.** Clicking any paper yields a high-quality "read next" neighborhood: title, abstract, top-5 nearest neighbors (with "show more" to 10), and an arXiv link. The neighborhood must feel topically coherent to a domain expert.
-3. **Stable across updates.** A monthly corpus refresh does not scramble the map. Returning users recognize the same landscape. Achieved via Procrustes alignment on IAIFI anchor points.
+3. **Stable across updates.** A monthly corpus refresh does not scramble the map. Returning users recognize the same landscape. Achieved via Procrustes alignment on IAIFI anchor points plus drift diagnostics (median + 95th percentile anchor displacement) with a defined high-drift policy.
 4. **Defensible semantics.** Local distances (within a cluster or neighborhood) are meaningful. Global geometry (distance between clusters) is approximate and disclaimed in the UI. No claims about "the field" that the embedding cannot support.
 
 ---
@@ -22,13 +22,13 @@ These four properties define "done." If any fails, the project has not shipped.
 | Failure Mode | Cause | Mitigation |
 |---|---|---|
 | Background misses IAIFI modes | Centroid-based selection averages over multi-modal distribution | kNN union from each IAIFI paper (solved in v1.5) |
-| Giant grey point cloud | Too many background points at overview zoom | Multiscale rendering (v1.5b progressive enhancement) |
-| UMAP drift between refreshes | Non-deterministic refit | Procrustes alignment using IAIFI anchors + fixed random_state |
+| Giant grey point cloud | kNN-union over-samples dense modes and introduces redundant neighbors | Diversity-aware kNN union (per-seed dedup + anti-hub scoring) plus multiscale rendering (v1.5b) |
+| UMAP drift between refreshes | Background refresh changes graph topology; alignment alone cannot fully prevent movement | Procrustes alignment + drift diagnostics (anchor displacement median/p95) + freeze/warn policy for high-drift refreshes |
 | Fake clusters | HDBSCAN finds structure in noise | Stability gating (n >= 50 AND stability >= threshold) + human curation |
 | Meaningless auto-labels | TF-IDF returns "quantum field gauge" | Human override via `configs/theme_overrides.yml`; never ship raw labels |
 | Over-interpretation of 2D layout | Users read global distances as meaningful | UI disclaimer: "Local neighborhoods are meaningful; global geometry is approximate" |
 | arXiv IP ban | Too-fast API requests | Enforced 3s delay, single connection, disk caching |
-| Hub papers dominate kNN | Some papers are nearest neighbors of many IAIFI papers | Document and monitor; cap per-paper inclusion count if needed |
+| Hub papers dominate kNN | Some papers are nearest neighbors of many IAIFI papers | Monitor hubness (p50/p95/max neighbor share); optional inclusion cap/diversity sampling if UX degrades |
 
 ---
 
@@ -163,6 +163,8 @@ iaifi:
 background:
   start_date: "2018-01-01"   # captures modern ML-physics wave; IAIFI founded 2020
   end_date: null              # null = today
+  date_field: submittedDate   # use submittedDate for corpus boundaries; see Step B note
+  query_time_utc: "0000"      # arXiv API expects YYYYMMDDHHMM (GMT)
   candidate_cap: 30000        # max papers in candidate pool
   categories:
     - hep-th
@@ -185,9 +187,17 @@ selection:
   method: knn_union            # kNN union from each IAIFI paper
   k: 20                        # top-k neighbors per IAIFI paper
   space: embedding_768d        # operate in full embedding space, NOT PCA-reduced
+  diversity:
+    enabled: true
+    per_seed_diverse_k: 12     # keep up to 12 non-redundant neighbors per IAIFI seed
+    near_duplicate_cosine: 0.985
+    anti_hub_weight: 0.2       # score = 0.8*relevance + 0.2*anti_hub
   target_background: 8000      # target after kNN union + dedup
   max_background: 10000        # hard cap
   bridge_ballast: 1000         # uniform random sample for cartographic continuity
+  hubness_monitor:
+    warn_if_neighbor_share_gt: 0.15
+    optional_hard_cap_share: null   # set, e.g., 0.30, only if method hubs hurt UX
 ```
 
 ### `configs/embedding.yaml`
@@ -210,6 +220,10 @@ compute:
 quality:
   sanity_check_count: 20       # random IAIFI papers to spot-check
   sanity_check_k: 10           # check top-k neighbors for each
+  monitor_hubness: true
+  track_truncation_rate: true
+  truncation_warn_fraction: 0.15
+  metadata_prefix_experiment: false  # OFF by default; enable only for controlled A/B tests
 ```
 
 ### `configs/umap.yaml`
@@ -244,12 +258,13 @@ update:
 hdbscan:
   min_cluster_size: 50
   min_samples: 10
-  metric: euclidean             # on PCA-50 embeddings
+  metric: euclidean             # on L2-normalized PCA-50 embeddings
   cluster_selection_method: eom # excess of mass (default)
 
 stability_gating:
   min_size: 50                  # clusters smaller than this get no label
   min_stability: 0.5            # HDBSCAN stability threshold
+  explicit_label_persistence_map: true  # do not assume enumerate(sorted(labels))
 
 noise_treatment:
   label: "Interdisciplinary / Uncategorized"
@@ -336,11 +351,27 @@ enrichment:
 **Output:** `data/raw/background_candidates.jsonl`
 **Dev time:** 2 hours | **Run time:** ~30-45 minutes (one-time; cached thereafter)
 
-1. For each category in `configs/corpus.yaml`, query arXiv API. Date bounds are derived from config at runtime: `start_date` is parsed from `corpus.yaml` (e.g. `"2018-01-01"` -> `2018`), and `end_date: null` resolves to `datetime.now().year`:
-   ```
-   start_year = int(config["background"]["start_date"][:4])
-   end_year = datetime.now().year if config["background"]["end_date"] is None else int(config["background"]["end_date"][:4])
-   url = f"http://export.arxiv.org/api/query?search_query=cat:{category}+AND+submittedDate:[{start_year}+TO+{end_year}]&start=0&max_results=2000"
+1. For each category in `configs/corpus.yaml`, query arXiv API using full GMT timestamps. arXiv date ranges must be `YYYYMMDDHHMM`, not bare years:
+   ```python
+   from datetime import datetime, timezone
+
+   def to_arxiv_ts(date_str: str | None, fallback_hhmm: str = "0000") -> str:
+       if date_str is None:
+           dt = datetime.now(timezone.utc)
+       else:
+           dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+       # arXiv expects YYYYMMDDHHMM in GMT, e.g. 201801010000
+       return dt.strftime("%Y%m%d") + fallback_hhmm
+
+   start_ts = to_arxiv_ts(config["background"]["start_date"], config["background"]["query_time_utc"])
+   end_ts = to_arxiv_ts(config["background"]["end_date"], config["background"]["query_time_utc"])
+   date_field = config["background"].get("date_field", "submittedDate")
+   # Example window: submittedDate:[201801010000+TO+202603090000]
+   search_query = f"cat:{category}+AND+{date_field}:[{start_ts}+TO+{end_ts}]"
+   url = (
+       "http://export.arxiv.org/api/query?"
+       f"search_query={search_query}&start={start}&max_results=2000"
+   )
    ```
 2. Paginate until exhausted or `per_category_cap` reached.
 3. Enforce 3s delay between requests. Retry with exponential backoff on 5xx.
@@ -349,8 +380,11 @@ enrichment:
 6. Cap total pool at 30K papers.
 7. Persist raw Atom XML responses to `data/raw/arxiv_api/` for reproducibility.
 8. Extract metadata to JSONL (same schema as Step A, with `is_iaifi: false`).
+9. Refresh semantics:
+   - Use `submittedDate` as the canonical corpus boundary field (stable interpretation: "when did this paper enter arXiv?").
+   - Use `lastUpdatedDate` only for delta-harvest checks in refresh jobs (to re-fetch changed metadata), then re-apply the `submittedDate` boundary before final inclusion.
 
-**Hubness documentation:** Some papers in dense regions (e.g., popular survey papers) may appear as nearest neighbors of many IAIFI papers in Step C. This is expected. If a single paper appears in >50% of IAIFI neighborhoods, log a warning. No automatic removal -- hubness is informative.
+**Hubness monitoring note:** SPECTER2 proximity can surface "method hubs" (generic surveys / transformer-method papers) across many IAIFI seeds. During Step C, log neighbor-share metrics for candidate papers (`p50`, `p95`, `max`). If `max_share > 0.15`, emit a warning and inspect top hub papers manually. Optional hard cap is available in config but defaults to off.
 
 ### Step C: Select Background via kNN Union
 
@@ -365,40 +399,81 @@ Algorithm:
 
 ```python
 import numpy as np
+from collections import Counter
 from sklearn.neighbors import NearestNeighbors
 
 # Load all embeddings (IAIFI + candidates)
 iaifi_embeddings = ...   # shape (547, 768)
 candidate_embeddings = ... # shape (30000, 768)
+rng = np.random.RandomState(42)
 
 # Build kNN index on candidates
-nn = NearestNeighbors(n_neighbors=20, metric='cosine', algorithm='auto')
+k = 20
+nn = NearestNeighbors(n_neighbors=k, metric='cosine', algorithm='auto')
 nn.fit(candidate_embeddings)
 
 # For each IAIFI paper, find top-k neighbors in candidate pool
 distances, indices = nn.kneighbors(iaifi_embeddings)
+similarities = 1.0 - distances
 
-# Union of all neighbor indices
+# Count how many IAIFI seeds pull each candidate (hubness signal)
+support_count = Counter(indices.ravel().tolist())
+
+# Assert unit vectors before using dot product as cosine in diversity dedup.
+candidate_norms = np.linalg.norm(candidate_embeddings, axis=1)
+assert np.allclose(candidate_norms, 1.0, atol=1e-3), (
+    "candidate_embeddings must be L2-normalized before diversity dedup"
+)
+
+# Diversity-aware union:
+# For each IAIFI seed, keep only non-near-duplicate neighbors to reduce dense-mode redundancy.
+per_seed_diverse_k = 12
+near_duplicate_cosine = 0.985
 selected_indices = set()
 for row in indices:
-    selected_indices.update(row.tolist())
+    kept = []
+    for cand_idx in row.tolist():
+        if len(kept) >= per_seed_diverse_k:
+            break
+        if not kept:
+            kept.append(cand_idx)
+            continue
+        # Candidate embeddings are unit vectors; dot product == cosine similarity.
+        max_pair_sim = (candidate_embeddings[cand_idx] @ candidate_embeddings[kept].T).max()
+        if max_pair_sim < near_duplicate_cosine:
+            kept.append(cand_idx)
+    selected_indices.update(kept)
 
 # Add bridge ballast: ~1K uniform random sample from candidates NOT already selected
 remaining = set(range(len(candidate_embeddings))) - selected_indices
-bridge = set(np.random.RandomState(42).choice(
+bridge = set(rng.choice(
     list(remaining), size=min(1000, len(remaining)), replace=False
 ))
 selected_indices |= bridge
 
-# Enforce max_background cap
+# Enforce max_background cap with anti-hub scoring
 max_background = 10000  # from config: selection.max_background
 if len(selected_indices) > max_background:
-    # Keep the top-max_background by highest cosine similarity to any IAIFI paper
-    all_selected = sorted(selected_indices)
+    all_selected = np.array(sorted(selected_indices))
     sim_to_iaifi = candidate_embeddings[all_selected] @ iaifi_embeddings.T  # (N_sel, 547)
-    max_sim = sim_to_iaifi.max(axis=1)  # best similarity to any IAIFI paper
-    top_k_idx = np.argsort(max_sim)[-max_background:]
-    selected_indices = set(np.array(all_selected)[top_k_idx].tolist())
+    max_sim = sim_to_iaifi.max(axis=1)
+    anti_hub = np.array([1.0 / np.sqrt(1.0 + support_count.get(int(i), 0)) for i in all_selected])
+    score = 0.8 * max_sim + 0.2 * anti_hub
+    top_k_idx = np.argsort(score)[-max_background:]
+    selected_indices = set(all_selected[top_k_idx].tolist())
+
+# Hubness diagnostics (required log line in pipeline output)
+neighbor_share = np.array([
+    support_count.get(int(i), 0) / iaifi_embeddings.shape[0] for i in selected_indices
+])
+print(
+    "Hubness share stats: "
+    f"p50={np.percentile(neighbor_share, 50):.3f}, "
+    f"p95={np.percentile(neighbor_share, 95):.3f}, "
+    f"max={neighbor_share.max():.3f}"
+)
+if neighbor_share.max() > 0.15:
+    print("WARNING: method-hub candidate detected (max neighbor share > 0.15)")
 
 # Result: typically 8-10K unique papers
 print(f"Selected {len(selected_indices)} background papers "
@@ -406,6 +481,8 @@ print(f"Selected {len(selected_indices)} background papers "
 ```
 
 **Rationale for kNN union over centroid:** Centroid-based selection assumes IAIFI's research is unimodal. It biases toward papers near the "average" IAIFI paper, which is meaningless for an institute spanning lattice QCD and deep learning theory. kNN union preserves multi-modal structure: a lattice QCD IAIFI paper pulls in lattice QCD background, a normalizing flows paper pulls in generative modeling background.
+
+**v2 density guardrail:** v2 keeps the kNN-union core but adds per-seed near-duplicate removal and anti-hub cap scoring before the 10K cap. This reduces "grey snowstorm" redundancy from dense modes while preserving support for sparser IAIFI modes.
 
 ### Step D: Embed Papers
 
@@ -458,6 +535,24 @@ for idx in random_iaifi_indices[:20]:
         print(f"  {sims[j]:.3f}  {papers[j]['title']}")
 ```
 
+**Monitoring guardrails (required):**
+
+1. **Hubness audit:** Reuse Step C logs (`p50`, `p95`, `max` neighbor share). If `max > 0.15`, inspect the top 10 hub papers and confirm they are not overwhelming user-visible neighborhoods.
+2. **Truncation audit (512-token limit):**
+   ```python
+   import numpy as np
+   token_lengths = []
+   for p in papers:
+       text = f"{p['title']}{tokenizer.sep_token}{p['abstract']}"
+       n_tokens = len(tokenizer(text, truncation=False)["input_ids"])
+       token_lengths.append(n_tokens)
+   truncation_rate = float(np.mean(np.array(token_lengths) > 512))
+   print(f"Truncation rate: {truncation_rate:.3f}")
+   if truncation_rate > 0.15:
+       print("WARNING: high truncation rate; run neighbor coherence spot-check before shipping")
+   ```
+3. **Controlled metadata-prefix experiment (optional, OFF by default):** If coherence checks fail and truncation is high, run a side-by-side experiment with a minimal prefix such as `"[cat=hep-th]"` prepended to input text. Accept only if it improves neighbor coherence without obvious "clustering-by-label" artifacts.
+
 ### Step E: Dimensionality Reduction
 
 **Script:** `src/iaifi_paperscape/reduce/run_pca_umap.py`
@@ -467,6 +562,7 @@ for idx in random_iaifi_indices[:20]:
 
 ```python
 from sklearn.decomposition import PCA
+from sklearn.preprocessing import normalize
 import umap
 import joblib
 
@@ -476,6 +572,8 @@ selected_embeddings = embeddings[selected_mask]  # shape ~(9000, 768)
 # 2. PCA to 50 dims (denoising + speed)
 pca = PCA(n_components=50, random_state=42)
 pca_embeddings = pca.fit_transform(selected_embeddings)
+# L2-normalize PCA vectors so Euclidean clustering is geometry-consistent with cosine neighborhoods.
+pca_embeddings = normalize(pca_embeddings, norm="l2", axis=1)
 np.save("data/interim/pca_50.npy", pca_embeddings)
 joblib.dump(pca, "data/models/pca_model.pkl")
 
@@ -500,10 +598,12 @@ np.save("data/processed/coords_2d.npy", coords_2d)
 | PCA n_components | 50 | Standard denoising pre-step; preserves >95% variance for SPECTER2 | Increase to 100 if clusters look fragmented; decrease to 30 if too slow |
 | n_neighbors | 40 | Broader than default 15; preserves sub-field structure without over-smoothing | Lower (20-30) if clusters are too diffuse; higher (50-60) for more global structure |
 | min_dist | 0.08 | Slightly tighter than default 0.1; shows cluster structure without over-clumping | Increase to 0.15 if points overlap too much; decrease to 0.03 for tighter clusters |
-| metric | cosine | SPECTER2 embeddings are L2-normalized; cosine is the intended similarity | Do not change |
+| metric | cosine | PCA-50 vectors are L2-normalized before UMAP/clustering; this keeps local geometry consistent with cosine neighborhoods | Do not change |
 | random_state | 42 | Reproducibility | Do not change |
 
 **densMAP note:** Standard UMAP is the default. densMAP (`densmap=True`) preserves local density information more faithfully but can produce less visually appealing layouts. Test it; if it improves the "is this cluster actually dense or just UMAP artifact?" question, use it. Do not default to it without testing.
+
+**Geometry consistency note (v2):** Clustering remains Euclidean for HDBSCAN, but it now operates on L2-normalized PCA vectors. On unit vectors, Euclidean distance is monotone in cosine distance, so clustering and neighbor semantics are aligned.
 
 ### Step E.1: Procrustes Alignment (Monthly Refit Only)
 
@@ -512,7 +612,8 @@ np.save("data/processed/coords_2d.npy", coords_2d)
 **Dev time:** 1.5 hours
 
 ```python
-from scipy.spatial import procrustes
+import numpy as np
+from scipy.linalg import orthogonal_procrustes
 
 def align_to_previous(new_coords, old_coords, anchor_mask):
     """
@@ -520,56 +621,118 @@ def align_to_previous(new_coords, old_coords, anchor_mask):
 
     anchor_mask: boolean array, True for IAIFI papers present in both layouts
     """
-    # Extract anchor points from both layouts
+    # Extract anchor points
     new_anchors = new_coords[anchor_mask]
     old_anchors = old_coords[anchor_mask]
 
-    # Compute Procrustes transformation (rotation + scaling + translation)
-    _, new_anchors_aligned, disparity = procrustes(old_anchors, new_anchors)
+    # Center both sets
+    new_mu = new_anchors.mean(axis=0)
+    old_mu = old_anchors.mean(axis=0)
+    new_centered = new_anchors - new_mu
+    old_centered = old_anchors - old_mu
 
-    # Apply same transformation to all points
-    # (Procrustes gives us the transformation implicitly;
-    #  we need to extract and apply it to non-anchor points too)
-    # ... full implementation with explicit rotation matrix extraction
+    # Scale to unit Frobenius norm
+    new_norm = np.linalg.norm(new_centered)
+    old_norm = np.linalg.norm(old_centered)
+    new_unit = new_centered / new_norm
+    old_unit = old_centered / old_norm
 
-    return aligned_coords, disparity
+    # Solve orthogonal Procrustes: new_unit @ R ~= old_unit
+    R, _ = orthogonal_procrustes(new_unit, old_unit)
+    scale = old_norm / new_norm
+
+    # Apply transform to all points (not just anchors)
+    aligned_coords = ((new_coords - new_mu) @ R) * scale + old_mu
+
+    # Drift diagnostics on anchors (post-alignment)
+    anchor_disp = np.linalg.norm(aligned_coords[anchor_mask] - old_coords[anchor_mask], axis=1)
+    drift = {
+        "median": float(np.median(anchor_disp)),
+        "p95": float(np.percentile(anchor_disp, 95)),
+        "max": float(np.max(anchor_disp)),
+    }
+
+    return aligned_coords, drift
 ```
+
+**Drift policy (required for monthly refits):**
+
+1. Compute anchor displacement diagnostics after Procrustes: median and 95th percentile.
+2. Define status bands:
+   - `LOW_DRIFT`: `median <= 0.03` and `p95 <= 0.08` -> publish normally.
+   - `MEDIUM_DRIFT`: not `LOW_DRIFT` and not `HIGH_DRIFT` -> publish, but flag for review in refresh logs.
+   - `HIGH_DRIFT`: `median > 0.05` or `p95 > 0.12` -> trigger mitigation.
+3. Mitigation for `HIGH_DRIFT`:
+   - Freeze previous month's background selection (`knn_selected_ids.json`) and rerun refit once.
+   - If still high-drift, publish with a visible "layout changed more than usual" notice and record diagnostics in `meta`.
+   - Do not silently overwrite prior layout without diagnostics.
 
 **Two update regimes (complementary, not alternative):**
 
 | Regime | When | Method | Layout impact |
 |---|---|---|---|
-| Incremental | Few new IAIFI papers, same background | `umap_model.transform(pca.transform(new_embeddings))` | Zero drift for existing points |
-| Monthly refit | Background corpus refresh, new kNN selection | Full PCA + UMAP refit, then Procrustes alignment | Minimal drift, anchored by IAIFI papers |
+| Incremental | Few new IAIFI papers, same background | `umap_model.transform(normalize(pca.transform(new_embeddings), norm="l2", axis=1))` | Zero drift for existing points |
+| Monthly refit | Background corpus refresh, new kNN selection | Full PCA + UMAP refit, then Procrustes alignment + drift diagnostics | Minimal drift when low-drift; freeze/warn policy when high-drift |
 
 ### Step F: Clustering and Labeling
 
 **Script:** `src/iaifi_paperscape/cluster/run_hdbscan.py`, `label_clusters.py`, `enrichment.py`
-**Input:** `data/interim/pca_50.npy`, paper metadata
+**Input:** `data/interim/pca_50.npy` (L2-normalized PCA-50), paper metadata
 **Output:** `data/processed/clusters.json`, `cluster_labels.json`, `enrichment.json`
 **Dev time:** 2.5 hours | **Run time:** ~1 minute
 
 #### F.1: HDBSCAN Clustering
 
 ```python
+import numpy as np
 import hdbscan
+
+def build_label_persistence_map(clusterer):
+    """
+    Explicit map from output cluster label -> persistence.
+    Do NOT rely on enumerate(sorted(unique_labels)).
+    """
+    clusterer.generate_prediction_data()
+    selected_tree_ids = list(clusterer.condensed_tree_._select_clusters())
+    persistence = np.asarray(clusterer.cluster_persistence_, dtype=float)
+
+    if len(selected_tree_ids) != len(persistence):
+        raise RuntimeError(
+            "HDBSCAN selected-cluster count != persistence count; abort unsafe stability gating."
+        )
+
+    # Internal ordering from HDBSCAN condensed tree.
+    persistence_by_tree_id = {
+        int(tree_id): float(p)
+        for tree_id, p in zip(selected_tree_ids, persistence)
+    }
+
+    # Internal map: tree cluster id -> emitted integer label.
+    cluster_map = clusterer._prediction_data.cluster_map
+    label_to_persistence = {}
+    for tree_id, label_id in cluster_map.items():
+        if label_id == -1:
+            continue
+        if int(tree_id) in persistence_by_tree_id:
+            label_to_persistence[int(label_id)] = persistence_by_tree_id[int(tree_id)]
+
+    return label_to_persistence
 
 clusterer = hdbscan.HDBSCAN(
     min_cluster_size=50,
     min_samples=10,
-    metric='euclidean',        # on PCA-50 embeddings
+    metric='euclidean',        # on L2-normalized PCA-50 embeddings
     cluster_selection_method='eom',
 )
 labels = clusterer.fit_predict(pca_embeddings)
 probabilities = clusterer.probabilities_
-stability_scores = clusterer.cluster_persistence_
+label_to_persistence = build_label_persistence_map(clusterer)
 
 # Stability gating: suppress labels for weak clusters
-# Note: cluster_persistence_ is a numpy array indexed by cluster label order
-unique_labels = sorted(set(labels) - {-1})
-for i, cluster_id in enumerate(unique_labels):
+for cluster_id in sorted(set(labels) - {-1}):
     mask = labels == cluster_id
-    if mask.sum() < 50 or stability_scores[i] < 0.5:
+    persistence = label_to_persistence.get(int(cluster_id), 0.0)
+    if mask.sum() < 50 or persistence < 0.5:
         labels[mask] = -1  # demote to noise
 ```
 
@@ -600,11 +763,19 @@ for k in [10, 15, 20, 25, 30]:
 #### F.3: Cluster Labeling
 
 ```python
+import json
 from sklearn.feature_extraction.text import TfidfVectorizer
 
 # For each cluster, compute TF-IDF on titles + abstracts
+# Persisted from Step F.1 output (cluster_id -> persistence)
+with open("data/processed/clusters.json", "r", encoding="utf-8") as f:
+    clusters_payload = json.load(f)
+label_to_persistence = {
+    int(c["id"]): float(c["stability"])
+    for c in clusters_payload["clusters"]
+}
 unique_labels = sorted(set(labels) - {-1})
-for i, cluster_id in enumerate(unique_labels):
+for cluster_id in unique_labels:
     cluster_texts = [
         f"{p['title']} {p['abstract']}"
         for p, l in zip(papers, labels) if l == cluster_id
@@ -626,7 +797,7 @@ for i, cluster_id in enumerate(unique_labels):
         "auto_label": top_ngrams[0],
         "label_candidates": top_ngrams[:3],
         "size": len(cluster_texts),
-        "stability": float(stability_scores[i]),
+        "stability": float(label_to_persistence.get(int(cluster_id), 0.0)),
     }
 ```
 
@@ -690,6 +861,8 @@ def compute_enrichment(labels, is_iaifi, alpha=1, beta=1):
 #### G.1: Precompute Neighbor Lists
 
 ```python
+import numpy as np
+from collections import Counter
 from sklearn.neighbors import NearestNeighbors
 
 # Build kNN on L2-normalized 768-d embeddings (selected papers only)
@@ -704,9 +877,25 @@ for i, paper_id in enumerate(paper_ids):
         {"id": paper_ids[indices[i][j]], "similarity": float(1 - distances[i][j])}
         for j in range(1, 11)  # skip self at index 0
     ]
+
+# Hubness diagnostics on final neighbor graph (method-hub monitoring)
+incoming = Counter()
+for nbrs in neighbors.values():
+    for edge in nbrs:
+        incoming[edge["id"]] += 1
+
+incoming_share = np.array([incoming[pid] / len(paper_ids) for pid in paper_ids])
+print(
+    "Final graph hubness: "
+    f"p50={np.percentile(incoming_share, 50):.3f}, "
+    f"p95={np.percentile(incoming_share, 95):.3f}, "
+    f"max={incoming_share.max():.3f}"
+)
 ```
 
 **Top 10 neighbors per paper** (not 20). The UX shows 5 in the side panel with a "show more" button to reveal all 10. This keeps JSON size manageable (~1.5MB for neighbor data alone).
+
+If hubness diagnostics show degraded UX (same generic methods papers dominating many panels), apply optional post-filtering: per-paper incoming cap plus diversity rerank (MMR-style) within each neighbor list. Keep this off by default and gate by manual review.
 
 #### G.2: JSON Schema for `papers.json`
 
@@ -915,11 +1104,13 @@ An optional thin Astro wrapper component can add context text above/below the if
 
 ### v1.5a (Launch)
 
-All points rendered at all zoom levels. Background at 30% opacity, IAIFI at full opacity. This is the v1 behavior and is sufficient for initial deployment with ~9K total points.
+All points rendered at all zoom levels. Background at 30% opacity, IAIFI at full opacity. This is sufficient for initial deployment with ~9K total points.
+
+Important caveat: opacity reduces visual dominance but does not solve sampling-density occlusion. Track simple occlusion diagnostics (e.g., screen-space fill ratio at default overview, plus median nearest-neighbor screen distance). If overview readability degrades, prioritize v1.5b.
 
 ### v1.5b (Fast Follow)
 
-Background points replaced by precomputed hexbin density heatmap at overview zoom. Crossfade to individual points when zoomed in past a threshold.
+Background points replaced by precomputed hexbin density heatmap at overview zoom. Crossfade to individual points when zoomed in past a threshold. This is the backstop when opacity-only rendering is not enough.
 
 **Implementation:**
 1. Precompute hexbin density in Python (not live KDE in the browser):
@@ -1117,7 +1308,7 @@ echo "=== Done. Output: web/data/papers.json ==="
 
 ## 9. v2 Enhancements (Deferred)
 
-These are explicitly out of scope for v1.5. Listed here for future reference.
+These are explicitly out of scope for the v2 launch scope. Listed here for future reference.
 
 | Enhancement | Description | Effort |
 |---|---|---|
@@ -1142,5 +1333,21 @@ These are explicitly out of scope for v1.5. Listed here for future reference.
 - UMAP documentation: https://umap-learn.readthedocs.io/en/latest/
 - UMAP .transform(): https://umap-learn.readthedocs.io/en/latest/transform.html
 - HDBSCAN documentation: https://hdbscan.readthedocs.io/en/latest/
+- HDBSCAN API reference: https://hdbscan.readthedocs.io/en/latest/api.html
 - regl-scatterplot: https://github.com/flekschas/regl-scatterplot
 - Procrustes analysis (scipy): https://docs.scipy.org/doc/scipy/reference/generated/scipy.spatial.procrustes.html
+
+---
+
+## 11. Changes from v1.5
+
+1. Bumped plan version header and metadata from v1.5 to v2.
+2. Fixed arXiv date-range query format in Step B to `YYYYMMDDHHMM` (GMT), with explicit example `submittedDate:[201801010000+TO+202603090000]`.
+3. Clarified refresh semantics in Step B: `submittedDate` for corpus boundaries, `lastUpdatedDate` only for delta-harvest checks before reapplying boundary rules.
+4. Added diversity-aware kNN-union mitigation in Step C (per-seed near-duplicate removal + anti-hub scoring) to reduce dense-mode redundancy and "grey snowstorm" behavior.
+5. Added hubness diagnostics and monitoring thresholds in Step B, Step C, and Step G; documented optional caps/diversity reranking only if UX degrades.
+6. Fixed geometry mismatch by L2-normalizing PCA-50 vectors before UMAP/clustering (Step E), with explicit rationale linking Euclidean-on-unit-vectors to cosine semantics.
+7. Replaced fragile HDBSCAN stability gating pseudocode with an explicit label->persistence map built from HDBSCAN internal cluster ordering (Step F.1), and propagated stable lookup into labeling (Step F.3).
+8. Expanded Procrustes section with explicit transform logic, anchor drift diagnostics (median/p95/max), and a high-drift policy (freeze background selection rerun, then warn if still high drift).
+9. Added embedding-quality monitoring for 512-token truncation and a controlled metadata-prefix experiment policy (off by default, with anti-label-leakage caution).
+10. Updated multiscale UI section to explicitly note opacity-vs-occlusion limits in v1.5a and position v1.5b hexbin as the required backstop when overview readability drops.
