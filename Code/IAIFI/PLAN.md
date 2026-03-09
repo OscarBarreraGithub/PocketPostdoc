@@ -22,12 +22,12 @@ These four properties define "done." If any fails, the project has not shipped.
 | Failure Mode | Cause | Mitigation |
 |---|---|---|
 | Background misses IAIFI modes | Centroid-based selection averages over multi-modal distribution | kNN union from each IAIFI paper (solved in v1.5) |
-| Giant grey point cloud | kNN-union over-samples dense modes and introduces redundant neighbors | Diversity-aware kNN union (per-seed dedup + anti-hub scoring) plus multiscale rendering (v1.5b) |
+| Giant grey point cloud | kNN-union over-samples dense modes and introduces redundant neighbors | Diversity-aware kNN union (per-seed dedup + anti-hub scoring) plus multiscale rendering (v2.1b) |
 | UMAP drift between refreshes | Background refresh changes graph topology; alignment alone cannot fully prevent movement | Procrustes alignment + drift diagnostics (anchor displacement median/p95) + freeze/warn policy for high-drift refreshes |
 | Fake clusters | HDBSCAN finds structure in noise | Stability gating (n >= 50 AND stability >= threshold) + human curation |
 | Meaningless auto-labels | TF-IDF returns "quantum field gauge" | Human override via `configs/theme_overrides.yml`; never ship raw labels |
 | Over-interpretation of 2D layout | Users read global distances as meaningful | UI disclaimer: "Local neighborhoods are meaningful; global geometry is approximate" |
-| arXiv IP ban | Too-fast API requests | Enforced 3s delay, single connection, disk caching |
+| arXiv IP ban / flaky harvests | Too-fast API requests, missing client identity, transient network failures | Enforced 3s delay, retry/backoff, explicit User-Agent/contact, disk caching |
 | Hub papers dominate kNN | Some papers are nearest neighbors of many IAIFI papers | Monitor hubness (p50/p95/max neighbor share); optional inclusion cap/diversity sampling if UX degrades |
 
 ---
@@ -170,6 +170,7 @@ background:
   sort_by: submittedDate      # explicit ordering for deterministic pagination
   sort_order: descending      # newest-first under per-category cap
   candidate_cap: 30000        # max papers in candidate pool
+  # Canonical processing order. Crosslist dedup is first-seen-wins in this order.
   categories:
     - hep-th
     - hep-ph
@@ -185,6 +186,11 @@ background:
     - cond-mat.stat-mech
   per_category_cap: 4000      # prevent any single category from dominating
   rate_limit_seconds: 3       # arXiv API rate limit
+  user_agent: "iaifi-paperscape/2.1 (+mailto:maintainer@example.org)"
+  timeout_seconds: 30
+  max_retries: 5
+  network_retry_base_seconds: 1.0
+  retry_statuses: [429, 500, 502, 503, 504]
   max_results_per_page: 2000  # arXiv pagination limit
 
 selection:
@@ -355,9 +361,12 @@ enrichment:
 **Output:** `data/raw/background_candidates.jsonl`
 **Dev time:** 2 hours | **Run time:** ~30-45 minutes (one-time; cached thereafter)
 
-1. For each category in `configs/corpus.yaml`, query arXiv API using full GMT timestamps. arXiv date ranges must be `YYYYMMDDHHMM`, not bare years:
+1. For each category in `configs/corpus.yaml`, iterate in the listed (canonical) order and query arXiv API using full GMT timestamps. arXiv date ranges must be `YYYYMMDDHHMM`, not bare years:
    ```python
+   import time
    import requests
+   from requests.adapters import HTTPAdapter
+   from urllib3.util.retry import Retry
    from datetime import datetime, timezone
 
    def to_arxiv_ts(date_str: str | None, fallback_hhmm: str = "0000") -> str:
@@ -368,6 +377,40 @@ enrichment:
        # arXiv expects YYYYMMDDHHMM in GMT, e.g. 201801010000
        return dt.strftime("%Y%m%d") + fallback_hhmm
 
+   def build_session(bg_cfg):
+       retries = Retry(
+           total=bg_cfg.get("max_retries", 5),
+           connect=bg_cfg.get("max_retries", 5),
+           read=bg_cfg.get("max_retries", 5),
+           status=bg_cfg.get("max_retries", 5),
+           backoff_factor=0.5,  # adapter-level backoff for retryable HTTP statuses
+           status_forcelist=tuple(bg_cfg.get("retry_statuses", [429, 500, 502, 503, 504])),
+           allowed_methods=frozenset(["GET"]),
+           respect_retry_after_header=True,
+           raise_on_status=False,
+       )
+       session = requests.Session()
+       session.headers.update({"User-Agent": bg_cfg["user_agent"]})
+       adapter = HTTPAdapter(max_retries=retries)
+       session.mount("http://", adapter)
+       session.mount("https://", adapter)
+       return session
+
+   def get_with_network_retry(session, url, params, bg_cfg):
+       max_tries = bg_cfg.get("max_retries", 5)
+       base = bg_cfg.get("network_retry_base_seconds", 1.0)
+       timeout = bg_cfg.get("timeout_seconds", 30)
+       for attempt in range(max_tries):
+           try:
+               resp = session.get(url, params=params, timeout=timeout)
+               resp.raise_for_status()
+               return resp
+           except (requests.exceptions.Timeout, requests.exceptions.ConnectionError):
+               if attempt == max_tries - 1:
+                   raise
+               time.sleep(base * (2 ** attempt))
+
+   session = build_session(config["background"])
    start_ts = to_arxiv_ts(config["background"]["start_date"], config["background"]["query_time_utc"])
    end_ts = to_arxiv_ts(config["background"]["end_date"], config["background"]["query_time_utc"])
    date_field = config["background"].get("date_field", "submittedDate")
@@ -380,18 +423,30 @@ enrichment:
        "sortOrder": config["background"].get("sort_order", "descending"),
    }
    # requests handles URL encoding for reserved characters (:, [, ], +, spaces).
-   resp = requests.get("http://export.arxiv.org/api/query", params=params, timeout=30)
-   resp.raise_for_status()
+   resp = get_with_network_retry(session, "http://export.arxiv.org/api/query", params, config["background"])
    ```
 2. Paginate until exhausted or `per_category_cap` reached. Keep `sortBy=submittedDate` + `sortOrder=descending` so the per-category "top N" is deterministic and newest-first.
-3. Enforce 3s delay between requests. Retry with exponential backoff on 5xx.
-4. Deduplicate by canonical arXiv ID (cross-listed papers appear in multiple categories).
+3. Enforce 3s delay between requests in addition to retry/backoff behavior.
+4. Deduplicate by canonical arXiv ID as entries stream in (not as a final pass). Crosslist handling is first-seen-wins in canonical category order:
+   ```python
+   seen_ids = set()
+   first_seen_category = {}
+   for category in config["background"]["categories"]:  # canonical order
+       for entry in page_entries:
+           aid = canonical_arxiv_id(entry.id)
+           if aid in seen_ids:
+               continue
+           seen_ids.add(aid)
+           first_seen_category[aid] = category
+           keep(entry, first_seen_category=category)
+   ```
 5. Exclude any paper already in the IAIFI set.
 6. Cap total pool at 30K papers.
 7. Persist raw Atom XML responses to `data/raw/arxiv_api/` for reproducibility.
 8. Extract metadata to JSONL (same schema as Step A, with `is_iaifi: false`).
 9. Refresh semantics:
    - **Invariant:** The corpus is the set of records whose `submittedDate` lies in `[start_ts, end_ts]`.
+   - **Determinism invariant:** For fixed config + category order + cache contents, inclusion decisions are deterministic; later categories cannot override earlier crosslist inclusion.
    - A refresh may re-fetch metadata for any record with `lastUpdatedDate` after the previous run, but the inclusion predicate is still only `submittedDate`.
    - `lastUpdatedDate` delta-harvest support should be tested end-to-end (query, parse, boundary re-application) before production use.
 
@@ -500,10 +555,13 @@ print(f"Selected {len(selected_indices)} background papers "
 - `anti_hub` is a mild regularizer to avoid over-representing ubiquitous method hubs.
 - For fixed `anti_hub_weight` and fixed `anti_hub`, the score is monotone in `max_sim`; raising `anti_hub_weight` too much can still reorder toward "rare but irrelevant" papers.
 - `support_count` intentionally uses raw initial top-k neighbors (before per-seed diversity filtering) so hubness reflects seed-level retrieval pressure, not post-filter artifacts.
+- Hubness here is defined with respect to IAIFI seed retrieval neighborhoods, not global arXiv-wide popularity.
 
 **Rationale for kNN union over centroid:** Centroid-based selection assumes IAIFI's research is unimodal. It biases toward papers near the "average" IAIFI paper, which is meaningless for an institute spanning lattice QCD and deep learning theory. kNN union preserves multi-modal structure: a lattice QCD IAIFI paper pulls in lattice QCD background, a normalizing flows paper pulls in generative modeling background.
 
 **v2.1 density guardrail:** v2.1 keeps the kNN-union core but widens the initial per-seed recall pool (`knn_initial_k=100`) before diversity filtering down to 12 neighbors, then applies anti-hub cap scoring before the 10K cap. This reduces dense-mode redundancy while preserving support for sparser IAIFI modes.
+
+**Complexity note:** Per-seed diversity filtering is approximately `O(knn_initial_k * per_seed_diverse_k * d)` cosine-dot work. At current scale (`~547` seeds, `k=100`, `per_seed_diverse_k=12`, `d=768`) this is fine on CPU; monitor runtime if IAIFI seed count grows into the low thousands.
 
 ### Step D: Embed Papers
 
@@ -664,6 +722,7 @@ def align_to_previous(new_coords, old_coords, anchor_mask):
     R, _ = orthogonal_procrustes(new_unit, old_unit)
     # Reflection policy: allow det(R) < 0 (mirror). In 2D maps this preserves neighborhoods
     # and is acceptable; we do not force a det(R)=+1 rotation-only transform.
+    reflected = bool(np.linalg.det(R) < 0)
     scale = old_norm / new_norm
 
     # Apply transform to all points (not just anchors)
@@ -675,12 +734,13 @@ def align_to_previous(new_coords, old_coords, anchor_mask):
         "median": float(np.median(anchor_disp)),
         "p95": float(np.percentile(anchor_disp, 95)),
         "max": float(np.max(anchor_disp)),
+        "reflected": reflected,
     }
 
     return aligned_coords, drift
 ```
 
-**Reflection policy (v2.1):** Reflections are explicitly allowed in Procrustes alignment. `orthogonal_procrustes` may return `det(R) = -1`; we accept this instead of forcing a rotation-only matrix.
+**Reflection policy (v2.1):** Reflections are explicitly allowed in Procrustes alignment. `orthogonal_procrustes` may return `det(R) = -1`; we accept this instead of forcing a rotation-only matrix. Always persist `reflected: true|false` in export `meta`; if `true`, include a brief "layout mirrored" note in refresh release notes/changelog.
 
 **Drift policy (required for monthly refits):**
 
@@ -934,6 +994,7 @@ If hubness diagnostics show degraded UX (same generic methods papers dominating 
     "version": "2026-03-09_specter2prox_n9547",
     "generated": "2026-03-09T14:30:00Z",
     "embedding_model": "specter2_proximity",
+    "reflected": false,
     "n_iaifi": 547,
     "n_background": 8453,
     "n_total": 9000,
@@ -1129,15 +1190,15 @@ An optional thin Astro wrapper component can add context text above/below the if
 
 ## 4. Multiscale UI (Progressive Enhancement)
 
-**This does NOT block launch.** Ship v1.5a first, add v1.5b as a fast follow.
+**This does NOT block launch.** Ship v2.1a first, add v2.1b as a fast follow.
 
-### v1.5a (Launch)
+### v2.1a (Launch)
 
 All points rendered at all zoom levels. Background at 30% opacity, IAIFI at full opacity. This is sufficient for initial deployment with ~9K total points.
 
-Important caveat: opacity reduces visual dominance but does not solve sampling-density occlusion. Track simple occlusion diagnostics (e.g., screen-space fill ratio at default overview, plus median nearest-neighbor screen distance). If overview readability degrades, prioritize v1.5b.
+Important caveat: opacity reduces visual dominance but does not solve sampling-density occlusion. Track simple occlusion diagnostics (e.g., screen-space fill ratio at default overview, plus median nearest-neighbor screen distance). If overview readability degrades, prioritize v2.1b.
 
-### v1.5b (Fast Follow)
+### v2.1b (Fast Follow)
 
 Background points replaced by precomputed hexbin density heatmap at overview zoom. Crossfade to individual points when zoomed in past a threshold. This is the backstop when opacity-only rendering is not enough.
 
@@ -1154,7 +1215,7 @@ Background points replaced by precomputed hexbin density heatmap at overview zoo
 3. Opacity crossfade: hexbin fades out as zoom increases, points fade in.
 4. **IAIFI points are ALWAYS visible at all zoom levels** -- they never collapse into hexbins.
 
-**Dev time for v1.5b:** 4-6 hours additional frontend work.
+**Dev time for v2.1b:** 4-6 hours additional frontend work.
 
 ---
 
@@ -1327,8 +1388,8 @@ echo "=== Done. Output: web/data/papers.json ==="
 | G: Export + neighbors | export_web_assets.py, compute_neighbors.py | 1.5 hours | 30 sec |
 | H: Frontend | web/* | 5 hours | — |
 | Polish + deploy | GitHub Pages + Action | 2 hours | — |
-| **Total v1.5a (launch)** | | **~22 hours** | **~35 min** |
-| v1.5b: Multiscale UI | (fast follow) | +5 hours | — |
+| **Total v2.1a (launch)** | | **~22 hours** | **~35 min** |
+| v2.1b: Multiscale UI | (fast follow) | +5 hours | — |
 | Optional: Citations | enrich_citations.py | +2 hours | 1-8 hours (API) |
 
 **Pipeline re-run time (cached, monthly refresh):** ~10 minutes (skip collection, re-embed only new papers, full UMAP refit + Procrustes).
@@ -1380,3 +1441,9 @@ These are explicitly out of scope for the v2 launch scope. Listed here for futur
 8. Pinned HDBSCAN to `hdbscan==0.8.38` because Step F.1 uses private internals, with an explicit regression-test requirement on upgrades.
 9. Updated Step E PCA variance language from guaranteed to typical and added a diagnostic print for `explained_variance_ratio_.sum()`.
 10. Documented Step E.1 Procrustes reflection policy explicitly: reflections (`det(R) < 0`) are allowed.
+11. Added explicit Step B crosslist determinism semantics: canonical category order + streaming dedup (`first_seen_category`) so later categories cannot change inclusion decisions.
+12. Added concrete Step B arXiv request robustness requirements: explicit `User-Agent`, retryable HTTP status handling, and separate timeout/connection retry loop with exponential backoff.
+13. Added Step C scaling note with complexity order and current operating-point estimate.
+14. Clarified that Step C hubness/anti-hub is defined relative to IAIFI-seed retrieval neighborhoods (not global arXiv hubness).
+15. Added `meta.reflected` export requirement and release-note guidance when Procrustes alignment applies a reflection.
+16. Renamed multiscale rollout labels from legacy `v1.5a/v1.5b` to `v2.1a/v2.1b`.
