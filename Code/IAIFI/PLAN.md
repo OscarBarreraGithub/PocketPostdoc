@@ -1,8 +1,8 @@
-# IAIFI Paperscape v2 — Implementation Plan
+# IAIFI Paperscape v2.1 — Implementation Plan
 
-**Version:** 2.0 (Final)
+**Version:** 2.1 (Final)
 **Date:** 2026-03-09
-**Status:** Approved by Claude + Codex cross-review (v2 update)
+**Status:** Approved by Claude + Codex cross-review (v2.1 update)
 
 ---
 
@@ -41,7 +41,7 @@ transformers>=4.30
 adapters>=0.2
 torch>=2.0
 umap-learn>=0.5
-hdbscan>=0.8
+hdbscan==0.8.38  # pinned: Step F.1 uses private HDBSCAN internals
 scikit-learn>=1.3
 numpy>=1.24
 pandas>=2.0
@@ -52,6 +52,8 @@ pyyaml>=6.0
 scipy>=1.11
 joblib>=1.3
 ```
+
+Pinning note: `build_label_persistence_map` depends on private HDBSCAN internals; keep `requirements.txt` on this exact version and run a label->persistence regression test before upgrading.
 
 Total install footprint: ~2GB (mostly PyTorch). All CPU-only.
 
@@ -165,6 +167,8 @@ background:
   end_date: null              # null = today
   date_field: submittedDate   # use submittedDate for corpus boundaries; see Step B note
   query_time_utc: "0000"      # arXiv API expects YYYYMMDDHHMM (GMT)
+  sort_by: submittedDate      # explicit ordering for deterministic pagination
+  sort_order: descending      # newest-first under per-category cap
   candidate_cap: 30000        # max papers in candidate pool
   categories:
     - hep-th
@@ -185,13 +189,13 @@ background:
 
 selection:
   method: knn_union            # kNN union from each IAIFI paper
-  k: 20                        # top-k neighbors per IAIFI paper
+  knn_initial_k: 100           # initial recall pool per IAIFI seed before diversity filter
   space: embedding_768d        # operate in full embedding space, NOT PCA-reduced
   diversity:
     enabled: true
     per_seed_diverse_k: 12     # keep up to 12 non-redundant neighbors per IAIFI seed
     near_duplicate_cosine: 0.985
-    anti_hub_weight: 0.2       # score = 0.8*relevance + 0.2*anti_hub
+    anti_hub_weight: 0.2       # mild regularizer; high values can favor rare but irrelevant papers
   target_background: 8000      # target after kNN union + dedup
   max_background: 10000        # hard cap
   bridge_ballast: 1000         # uniform random sample for cartographic continuity
@@ -353,6 +357,7 @@ enrichment:
 
 1. For each category in `configs/corpus.yaml`, query arXiv API using full GMT timestamps. arXiv date ranges must be `YYYYMMDDHHMM`, not bare years:
    ```python
+   import requests
    from datetime import datetime, timezone
 
    def to_arxiv_ts(date_str: str | None, fallback_hhmm: str = "0000") -> str:
@@ -366,14 +371,19 @@ enrichment:
    start_ts = to_arxiv_ts(config["background"]["start_date"], config["background"]["query_time_utc"])
    end_ts = to_arxiv_ts(config["background"]["end_date"], config["background"]["query_time_utc"])
    date_field = config["background"].get("date_field", "submittedDate")
-   # Example window: submittedDate:[201801010000+TO+202603090000]
-   search_query = f"cat:{category}+AND+{date_field}:[{start_ts}+TO+{end_ts}]"
-   url = (
-       "http://export.arxiv.org/api/query?"
-       f"search_query={search_query}&start={start}&max_results=2000"
-   )
+   search_query = f"cat:{category} AND {date_field}:[{start_ts} TO {end_ts}]"
+   params = {
+       "search_query": search_query,
+       "start": start,
+       "max_results": config["background"]["max_results_per_page"],
+       "sortBy": config["background"].get("sort_by", "submittedDate"),
+       "sortOrder": config["background"].get("sort_order", "descending"),
+   }
+   # requests handles URL encoding for reserved characters (:, [, ], +, spaces).
+   resp = requests.get("http://export.arxiv.org/api/query", params=params, timeout=30)
+   resp.raise_for_status()
    ```
-2. Paginate until exhausted or `per_category_cap` reached.
+2. Paginate until exhausted or `per_category_cap` reached. Keep `sortBy=submittedDate` + `sortOrder=descending` so the per-category "top N" is deterministic and newest-first.
 3. Enforce 3s delay between requests. Retry with exponential backoff on 5xx.
 4. Deduplicate by canonical arXiv ID (cross-listed papers appear in multiple categories).
 5. Exclude any paper already in the IAIFI set.
@@ -381,8 +391,9 @@ enrichment:
 7. Persist raw Atom XML responses to `data/raw/arxiv_api/` for reproducibility.
 8. Extract metadata to JSONL (same schema as Step A, with `is_iaifi: false`).
 9. Refresh semantics:
-   - Use `submittedDate` as the canonical corpus boundary field (stable interpretation: "when did this paper enter arXiv?").
-   - Use `lastUpdatedDate` only for delta-harvest checks in refresh jobs (to re-fetch changed metadata), then re-apply the `submittedDate` boundary before final inclusion.
+   - **Invariant:** The corpus is the set of records whose `submittedDate` lies in `[start_ts, end_ts]`.
+   - A refresh may re-fetch metadata for any record with `lastUpdatedDate` after the previous run, but the inclusion predicate is still only `submittedDate`.
+   - `lastUpdatedDate` delta-harvest support should be tested end-to-end (query, parse, boundary re-application) before production use.
 
 **Hubness monitoring note:** SPECTER2 proximity can surface "method hubs" (generic surveys / transformer-method papers) across many IAIFI seeds. During Step C, log neighbor-share metrics for candidate papers (`p50`, `p95`, `max`). If `max_share > 0.15`, emit a warning and inspect top hub papers manually. Optional hard cap is available in config but defaults to off.
 
@@ -408,15 +419,16 @@ candidate_embeddings = ... # shape (30000, 768)
 rng = np.random.RandomState(42)
 
 # Build kNN index on candidates
-k = 20
-nn = NearestNeighbors(n_neighbors=k, metric='cosine', algorithm='auto')
+knn_initial_k = 100  # from config: selection.knn_initial_k
+nn = NearestNeighbors(n_neighbors=knn_initial_k, metric='cosine', algorithm='auto')
 nn.fit(candidate_embeddings)
 
-# For each IAIFI paper, find top-k neighbors in candidate pool
+# For each IAIFI paper, find initial top-k neighbors in candidate pool
 distances, indices = nn.kneighbors(iaifi_embeddings)
 similarities = 1.0 - distances
 
-# Count how many IAIFI seeds pull each candidate (hubness signal)
+# Count how many IAIFI seeds pull each candidate (hubness signal).
+# Intentionally computed on raw initial top-k BEFORE diversity filtering.
 support_count = Counter(indices.ravel().tolist())
 
 # Assert unit vectors before using dot product as cosine in diversity dedup.
@@ -455,10 +467,13 @@ selected_indices |= bridge
 max_background = 10000  # from config: selection.max_background
 if len(selected_indices) > max_background:
     all_selected = np.array(sorted(selected_indices))
+    # Relevance = closest-to-any-seed cosine similarity.
     sim_to_iaifi = candidate_embeddings[all_selected] @ iaifi_embeddings.T  # (N_sel, 547)
     max_sim = sim_to_iaifi.max(axis=1)
+    # anti_hub is a mild regularizer, not a replacement for semantic relevance.
     anti_hub = np.array([1.0 / np.sqrt(1.0 + support_count.get(int(i), 0)) for i in all_selected])
-    score = 0.8 * max_sim + 0.2 * anti_hub
+    anti_hub_weight = 0.2
+    score = (1.0 - anti_hub_weight) * max_sim + anti_hub_weight * anti_hub
     top_k_idx = np.argsort(score)[-max_background:]
     selected_indices = set(all_selected[top_k_idx].tolist())
 
@@ -480,9 +495,15 @@ print(f"Selected {len(selected_indices)} background papers "
       f"({len(selected_indices) - len(bridge)} via kNN, {len(bridge)} bridge ballast)")
 ```
 
+**Scoring semantics note (v2.1):**
+- `max_sim` is the primary relevance term ("closest to at least one IAIFI seed").
+- `anti_hub` is a mild regularizer to avoid over-representing ubiquitous method hubs.
+- For fixed `anti_hub_weight` and fixed `anti_hub`, the score is monotone in `max_sim`; raising `anti_hub_weight` too much can still reorder toward "rare but irrelevant" papers.
+- `support_count` intentionally uses raw initial top-k neighbors (before per-seed diversity filtering) so hubness reflects seed-level retrieval pressure, not post-filter artifacts.
+
 **Rationale for kNN union over centroid:** Centroid-based selection assumes IAIFI's research is unimodal. It biases toward papers near the "average" IAIFI paper, which is meaningless for an institute spanning lattice QCD and deep learning theory. kNN union preserves multi-modal structure: a lattice QCD IAIFI paper pulls in lattice QCD background, a normalizing flows paper pulls in generative modeling background.
 
-**v2 density guardrail:** v2 keeps the kNN-union core but adds per-seed near-duplicate removal and anti-hub cap scoring before the 10K cap. This reduces "grey snowstorm" redundancy from dense modes while preserving support for sparser IAIFI modes.
+**v2.1 density guardrail:** v2.1 keeps the kNN-union core but widens the initial per-seed recall pool (`knn_initial_k=100`) before diversity filtering down to 12 neighbors, then applies anti-hub cap scoring before the 10K cap. This reduces dense-mode redundancy while preserving support for sparser IAIFI modes.
 
 ### Step D: Embed Papers
 
@@ -572,6 +593,8 @@ selected_embeddings = embeddings[selected_mask]  # shape ~(9000, 768)
 # 2. PCA to 50 dims (denoising + speed)
 pca = PCA(n_components=50, random_state=42)
 pca_embeddings = pca.fit_transform(selected_embeddings)
+retained_var = float(pca.explained_variance_ratio_.sum())
+print(f"PCA retained variance ratio sum: {retained_var:.4f}")
 # L2-normalize PCA vectors so Euclidean clustering is geometry-consistent with cosine neighborhoods.
 pca_embeddings = normalize(pca_embeddings, norm="l2", axis=1)
 np.save("data/interim/pca_50.npy", pca_embeddings)
@@ -595,7 +618,7 @@ np.save("data/processed/coords_2d.npy", coords_2d)
 
 | Parameter | Value | Rationale | Tuning guidance |
 |---|---|---|---|
-| PCA n_components | 50 | Standard denoising pre-step; preserves >95% variance for SPECTER2 | Increase to 100 if clusters look fragmented; decrease to 30 if too slow |
+| PCA n_components | 50 | Standard denoising pre-step; typically >95% variance for SPECTER2 (verify via logged `explained_variance_ratio_.sum()`) | Increase to 100 if clusters look fragmented; decrease to 30 if too slow |
 | n_neighbors | 40 | Broader than default 15; preserves sub-field structure without over-smoothing | Lower (20-30) if clusters are too diffuse; higher (50-60) for more global structure |
 | min_dist | 0.08 | Slightly tighter than default 0.1; shows cluster structure without over-clumping | Increase to 0.15 if points overlap too much; decrease to 0.03 for tighter clusters |
 | metric | cosine | PCA-50 vectors are L2-normalized before UMAP/clustering; this keeps local geometry consistent with cosine neighborhoods | Do not change |
@@ -639,6 +662,8 @@ def align_to_previous(new_coords, old_coords, anchor_mask):
 
     # Solve orthogonal Procrustes: new_unit @ R ~= old_unit
     R, _ = orthogonal_procrustes(new_unit, old_unit)
+    # Reflection policy: allow det(R) < 0 (mirror). In 2D maps this preserves neighborhoods
+    # and is acceptable; we do not force a det(R)=+1 rotation-only transform.
     scale = old_norm / new_norm
 
     # Apply transform to all points (not just anchors)
@@ -654,6 +679,8 @@ def align_to_previous(new_coords, old_coords, anchor_mask):
 
     return aligned_coords, drift
 ```
+
+**Reflection policy (v2.1):** Reflections are explicitly allowed in Procrustes alignment. `orthogonal_procrustes` may return `det(R) = -1`; we accept this instead of forcing a rotation-only matrix.
 
 **Drift policy (required for monthly refits):**
 
@@ -682,6 +709,8 @@ def align_to_previous(new_coords, old_coords, anchor_mask):
 **Dev time:** 2.5 hours | **Run time:** ~1 minute
 
 #### F.1: HDBSCAN Clustering
+
+Implementation note: `build_label_persistence_map` intentionally uses private HDBSCAN internals; keep `hdbscan==0.8.38` pinned and run a regression test on upgrade.
 
 ```python
 import numpy as np
@@ -1339,15 +1368,15 @@ These are explicitly out of scope for the v2 launch scope. Listed here for futur
 
 ---
 
-## 11. Changes from v1.5
+## 11. Changes from v2.0
 
-1. Bumped plan version header and metadata from v1.5 to v2.
-2. Fixed arXiv date-range query format in Step B to `YYYYMMDDHHMM` (GMT), with explicit example `submittedDate:[201801010000+TO+202603090000]`.
-3. Clarified refresh semantics in Step B: `submittedDate` for corpus boundaries, `lastUpdatedDate` only for delta-harvest checks before reapplying boundary rules.
-4. Added diversity-aware kNN-union mitigation in Step C (per-seed near-duplicate removal + anti-hub scoring) to reduce dense-mode redundancy and "grey snowstorm" behavior.
-5. Added hubness diagnostics and monitoring thresholds in Step B, Step C, and Step G; documented optional caps/diversity reranking only if UX degrades.
-6. Fixed geometry mismatch by L2-normalizing PCA-50 vectors before UMAP/clustering (Step E), with explicit rationale linking Euclidean-on-unit-vectors to cosine semantics.
-7. Replaced fragile HDBSCAN stability gating pseudocode with an explicit label->persistence map built from HDBSCAN internal cluster ordering (Step F.1), and propagated stable lookup into labeling (Step F.3).
-8. Expanded Procrustes section with explicit transform logic, anchor drift diagnostics (median/p95/max), and a high-drift policy (freeze background selection rerun, then warn if still high drift).
-9. Added embedding-quality monitoring for 512-token truncation and a controlled metadata-prefix experiment policy (off by default, with anti-label-leakage caution).
-10. Updated multiscale UI section to explicitly note opacity-vs-occlusion limits in v1.5a and position v1.5b hexbin as the required backstop when overview readability drops.
+1. Bumped plan header and metadata from v2.0 to v2.1.
+2. Fixed Step B arXiv query construction to use `requests.get(..., params=...)` so reserved characters are URL-encoded correctly.
+3. Added explicit Step B pagination order (`sortBy=submittedDate`, `sortOrder=descending`) to make capped per-category retrieval deterministic and newest-first.
+4. Added an explicit Step B corpus invariant: inclusion is by `submittedDate` in `[start_ts, end_ts]`; refresh re-fetch via `lastUpdatedDate` does not change the inclusion predicate.
+5. Added a Step B note that `lastUpdatedDate` delta-harvest support must be validated end-to-end before production use.
+6. Updated Step C diversity design to use `selection.knn_initial_k: 100` before per-seed diversity filtering to 12.
+7. Documented Step C anti-hub scoring semantics: `max_sim` is relevance, `anti_hub` is a mild regularizer, and excessive anti-hub weight risks selecting rare but irrelevant papers; clarified that `support_count` is intentionally from raw top-k.
+8. Pinned HDBSCAN to `hdbscan==0.8.38` because Step F.1 uses private internals, with an explicit regression-test requirement on upgrades.
+9. Updated Step E PCA variance language from guaranteed to typical and added a diagnostic print for `explained_variance_ratio_.sum()`.
+10. Documented Step E.1 Procrustes reflection policy explicitly: reflections (`det(R) < 0`) are allowed.
