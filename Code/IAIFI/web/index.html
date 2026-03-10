@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
   <title>IAIFI Research Landscape</title>
   <link rel="stylesheet" href="style.css">
 </head>
@@ -13,6 +14,7 @@
       <div id="search-wrap">
         <input type="text" id="search" placeholder="Search by title or author...">
         <button id="search-clear" class="hidden" aria-label="Clear search">&times;</button>
+        <span id="search-count" class="hidden"></span>
       </div>
       <div id="theme-filters">
         <button data-theme="all" class="active">All</button>
@@ -29,7 +31,6 @@
         </select>
       </div>
       <div id="year-slider">
-        <!-- min/max derived from meta in papers.json at load time -->
         <label>Year: <span id="year-range"></span></label>
         <div id="year-inputs">
           <input type="range" id="year-min">
@@ -48,8 +49,14 @@
           <span class="legend-item"><span class="legend-dot" style="width:24px;height:24px;"></span>1000+</span>
         </div>
       </div>
+      <div id="hover-toggle-wrap">
+        <label>
+          <input type="checkbox" id="hover-all-toggle">
+          Show all on hover
+        </label>
+      </div>
     </div>
-    <div id="data-version"></div>
+    <div id="paper-count"></div>
   </header>
 
   <main>
@@ -57,6 +64,7 @@
     <div id="tooltip" class="hidden"></div>
     <div id="side-panel" class="hidden">
       <button id="close-panel">&times;</button>
+      <div id="panel-bg-notice" class="hidden">Background paper — not an IAIFI publication</div>
       <h2 id="panel-title"></h2>
       <p id="panel-authors"></p>
       <p id="panel-meta"></p>
@@ -69,11 +77,13 @@
   </main>
 
   <footer>
-    <p>Local neighborhoods are meaningful; global geometry is approximate.
-       <a href="https://iaifi.org">IAIFI</a></p>
+    <p>
+      Local neighborhoods are meaningful; global geometry is approximate.
+      <a href="https://iaifi.org">IAIFI</a>
+      <span id="data-version"></span>
+    </p>
   </footer>
 
-  <script src="https://unpkg.com/regl-scatterplot@1.9.2/dist/regl-scatterplot.min.js"></script>
   <script src="scatter.js"></script>
 </body>
 </html>

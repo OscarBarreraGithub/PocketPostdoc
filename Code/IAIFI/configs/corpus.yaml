@@ -39,7 +39,7 @@ selection:
   space: embedding_768d        # operate in full embedding space, NOT PCA-reduced
   diversity:
     enabled: true
-    per_seed_diverse_k: 12     # keep up to 12 non-redundant neighbors per IAIFI seed
+    per_seed_diverse_k: 40     # keep up to 40 non-redundant neighbors per IAIFI seed
     near_duplicate_cosine: 0.985
     anti_hub_weight: 0.2       # mild regularizer; high values can favor rare but irrelevant papers
   target_background: 8000      # target after kNN union + dedup

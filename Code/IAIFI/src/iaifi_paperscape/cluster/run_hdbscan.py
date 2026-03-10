@@ -12,9 +12,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import hdbscan
 import numpy as np
-from sklearn.cluster import MiniBatchKMeans
+from sklearn.cluster import HDBSCAN, MiniBatchKMeans
 from sklearn.metrics import silhouette_score
 
 from iaifi_paperscape.utils.io import load_numpy, load_yaml_config, save_json
@@ -29,41 +28,29 @@ BENCHMARK_OUT_PATH = PROJECT_ROOT / "data" / "processed" / "kmeans_benchmark.jso
 
 
 # ---------------------------------------------------------------------------
-# Label -> persistence mapping using HDBSCAN private internals
-# (pinned: hdbscan==0.8.38)
+# Label -> stability mapping using sklearn.cluster.HDBSCAN
 # ---------------------------------------------------------------------------
 
-def build_label_persistence_map(clusterer: hdbscan.HDBSCAN) -> dict[int, float]:
-    """Explicit map from output cluster label -> persistence.
+def build_label_persistence_map(clusterer: HDBSCAN) -> dict[int, float]:
+    """Map from output cluster label -> stability proxy.
 
-    Do NOT rely on ``enumerate(sorted(unique_labels))``.
+    sklearn's HDBSCAN does not expose the private condensed-tree internals
+    that the standalone ``hdbscan`` package had.  Instead we use the mean
+    membership probability (``clusterer.probabilities_``) of points assigned
+    to each cluster as a proxy for cluster stability.  Values range [0, 1].
     """
-    clusterer.generate_prediction_data()
-    selected_tree_ids = list(clusterer.condensed_tree_._select_clusters())
-    persistence = np.asarray(clusterer.cluster_persistence_, dtype=float)
+    labels = clusterer.labels_
+    probabilities = clusterer.probabilities_
+    # sklearn HDBSCAN may emit -1 (noise), -2 (inf rows), -3 (nan rows);
+    # exclude all negative labels so we only iterate real clusters.
+    unique_labels = sorted(lbl for lbl in set(labels) if lbl >= 0)
 
-    if len(selected_tree_ids) != len(persistence):
-        raise RuntimeError(
-            "HDBSCAN selected-cluster count != persistence count; "
-            "abort unsafe stability gating."
-        )
+    label_to_stability: dict[int, float] = {}
+    for cid in unique_labels:
+        mask = labels == cid
+        label_to_stability[int(cid)] = float(np.mean(probabilities[mask]))
 
-    # Internal ordering from HDBSCAN condensed tree.
-    persistence_by_tree_id = {
-        int(tree_id): float(p)
-        for tree_id, p in zip(selected_tree_ids, persistence)
-    }
-
-    # Internal map: tree cluster id -> emitted integer label.
-    cluster_map = clusterer._prediction_data.cluster_map
-    label_to_persistence: dict[int, float] = {}
-    for tree_id, label_id in cluster_map.items():
-        if label_id == -1:
-            continue
-        if int(tree_id) in persistence_by_tree_id:
-            label_to_persistence[int(label_id)] = persistence_by_tree_id[int(tree_id)]
-
-    return label_to_persistence
+    return label_to_stability
 
 
 # ---------------------------------------------------------------------------
@@ -86,41 +73,46 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # F.1: HDBSCAN clustering
     # -----------------------------------------------------------------------
-    clusterer = hdbscan.HDBSCAN(
+    clusterer = HDBSCAN(
         min_cluster_size=int(hdbscan_cfg.get("min_cluster_size", 50)),
         min_samples=int(hdbscan_cfg.get("min_samples", 10)),
         metric=str(hdbscan_cfg.get("metric", "euclidean")),
         cluster_selection_method=str(hdbscan_cfg.get("cluster_selection_method", "eom")),
-        gen_min_span_tree=True,
+        store_centers="centroid",
     )
     labels = clusterer.fit_predict(pca_embeddings)
     probabilities = clusterer.probabilities_
 
     label_to_persistence = build_label_persistence_map(clusterer)
 
-    unique_before = sorted(set(labels) - {-1})
+    # Exclude all negative labels (noise / inf / nan markers from sklearn)
+    unique_before = sorted(lbl for lbl in set(labels) if lbl >= 0)
     print(f"HDBSCAN found {len(unique_before)} clusters before stability gating.")
 
     # -----------------------------------------------------------------------
     # Stability gating: demote weak clusters to noise (-1)
     # -----------------------------------------------------------------------
     min_size = int(stability_cfg.get("min_size", 50))
-    min_stability = float(stability_cfg.get("min_stability", 0.5))
+    # NOTE: This threshold is based on mean membership probability (range
+    # [0, 1]), not the old cluster_persistence_ metric.  0.3 is a
+    # conservative starting point; tune after inspecting the first run.
+    min_stability = float(stability_cfg.get("min_stability", 0.3))
 
     demoted = []
     for cluster_id in unique_before:
         mask = labels == cluster_id
         persistence = label_to_persistence.get(int(cluster_id), 0.0)
         if mask.sum() < min_size or persistence < min_stability:
-            labels[mask] = -1
+            labels[mask] = -1  # demote to noise
             demoted.append(cluster_id)
 
-    unique_after = sorted(set(labels) - {-1})
+    unique_after = sorted(lbl for lbl in set(labels) if lbl >= 0)
+    n_noise = int((labels < 0).sum())
     print(
         f"After stability gating: {len(unique_after)} clusters "
         f"({len(demoted)} demoted to noise)."
     )
-    print(f"Noise points: {int((labels == -1).sum())} / {len(labels)}")
+    print(f"Noise points: {n_noise} / {len(labels)}")
 
     # -----------------------------------------------------------------------
     # Build output payload
@@ -137,7 +129,7 @@ def main() -> None:
     payload = {
         "n_papers": int(len(labels)),
         "n_clusters": len(unique_after),
-        "n_noise": int((labels == -1).sum()),
+        "n_noise": int((labels < 0).sum()),
         "demoted_clusters": [int(c) for c in demoted],
         "labels": [int(l) for l in labels],
         "probabilities": [float(p) for p in probabilities],

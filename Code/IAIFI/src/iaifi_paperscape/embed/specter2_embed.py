@@ -45,8 +45,8 @@ def load_specter2_model(
 
     tokenizer = AutoTokenizer.from_pretrained(base_model)
     model = AutoAdapterModel.from_pretrained(base_model)
-    model.load_adapter(adapter_name, source=adapter_source)
-    model.set_active_adapters(adapter_name)
+    loaded_name = model.load_adapter(adapter_name, source=adapter_source)
+    model.set_active_adapters(loaded_name)
     model.eval()
 
     return tokenizer, model

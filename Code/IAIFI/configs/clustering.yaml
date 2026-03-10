@@ -1,12 +1,12 @@
 hdbscan:
-  min_cluster_size: 50
-  min_samples: 10
+  min_cluster_size: 15
+  min_samples: 2
   metric: euclidean             # on L2-normalized PCA-50 embeddings
-  cluster_selection_method: eom # excess of mass (default)
+  cluster_selection_method: leaf # leaf breaks mega-clusters into finer sub-clusters
 
 stability_gating:
-  min_size: 50                  # clusters smaller than this get no label
-  min_stability: 0.5            # HDBSCAN stability threshold
+  min_size: 15                  # clusters smaller than this get no label
+  min_stability: 0.05           # HDBSCAN stability threshold (lowered to retain more clusters)
   explicit_label_persistence_map: true  # do not assume enumerate(sorted(labels))
 
 noise_treatment:

@@ -9,3 +9,15 @@
 # ...
 #
 # This file MUST be reviewed and populated before shipping.
+
+0: "Quantum Optimization"
+1: "Astrophysics & Cosmology"
+2: "Neural PDE Solvers"
+3: "Inverse Problems & Diffusion Models"
+4: "Out-of-Distribution Detection"
+5: "Molecular Dynamics & Equivariant Networks"
+6: "Uncertainty Quantification & Conformal Prediction"
+7: "Generative Models for Science"
+8: "Medical Image Segmentation"
+9: "Foundation Models & Reasoning"
+10: "Efficient Hardware & Edge Deployment"

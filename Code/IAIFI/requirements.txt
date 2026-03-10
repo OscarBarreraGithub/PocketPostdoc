@@ -2,8 +2,7 @@ transformers>=4.30
 adapters>=0.2
 torch>=2.0
 umap-learn>=0.5
-hdbscan==0.8.38  # pinned: Step F.1 uses private HDBSCAN internals
-scikit-learn>=1.3
+scikit-learn>=1.8  # sklearn.cluster.HDBSCAN used instead of standalone hdbscan package
 numpy>=1.24
 pandas>=2.0
 feedparser>=6.0
