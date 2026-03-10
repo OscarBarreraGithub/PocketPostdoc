@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>IAIFI Research Landscape</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>IAIFI Research Landscape</h1>
+    <div id="controls">
+      <div id="search-wrap">
+        <input type="text" id="search" placeholder="Search by title or author...">
+        <button id="search-clear" class="hidden" aria-label="Clear search">&times;</button>
+        <span id="search-count" class="hidden"></span>
+      </div>
+      <div id="theme-filters">
+        <button data-theme="all" class="active">All</button>
+        <button data-theme="AI">AI</button>
+        <button data-theme="Physics">Physics</button>
+        <button data-theme="Both">Both</button>
+      </div>
+      <div id="color-by">
+        <label>Color by:</label>
+        <select id="color-mode">
+          <option value="theme">IAIFI Theme</option>
+          <option value="category">arXiv Category</option>
+          <option value="enrichment">Cluster Enrichment</option>
+        </select>
+      </div>
+      <div id="year-slider">
+        <label>Year: <span id="year-range"></span></label>
+        <div id="year-inputs">
+          <input type="range" id="year-min">
+          <input type="range" id="year-max">
+        </div>
+      </div>
+      <div id="citation-toggle-wrap">
+        <label>
+          <input type="checkbox" id="citation-toggle">
+          Size by citations
+        </label>
+        <div id="citation-legend" class="hidden">
+          <span class="legend-item"><span class="legend-dot" style="width:6px;height:6px;"></span>1</span>
+          <span class="legend-item"><span class="legend-dot" style="width:10px;height:10px;"></span>10</span>
+          <span class="legend-item"><span class="legend-dot" style="width:16px;height:16px;"></span>100</span>
+          <span class="legend-item"><span class="legend-dot" style="width:24px;height:24px;"></span>1000+</span>
+        </div>
+      </div>
+      <div id="hover-toggle-wrap">
+        <label>
+          <input type="checkbox" id="hover-all-toggle">
+          Show all on hover
+        </label>
+      </div>
+    </div>
+    <div id="paper-count"></div>
+  </header>
+
+  <main>
+    <div id="scatter-container"></div>
+    <div id="tooltip" class="hidden"></div>
+    <div id="side-panel" class="hidden">
+      <button id="close-panel">&times;</button>
+      <div id="panel-bg-notice" class="hidden">Background paper — not an IAIFI publication</div>
+      <h2 id="panel-title"></h2>
+      <p id="panel-authors"></p>
+      <p id="panel-meta"></p>
+      <div id="panel-abstract"></div>
+      <h3>Related Papers</h3>
+      <ul id="panel-neighbors"></ul>
+      <button id="show-more-neighbors" class="hidden">Show 5 more</button>
+      <a id="panel-arxiv" href="#" target="_blank">View on arXiv &rarr;</a>
+    </div>
+  </main>
+
+  <footer>
+    <p>
+      Local neighborhoods are meaningful; global geometry is approximate.
+      <a href="https://iaifi.org">IAIFI</a>
+      <span id="data-version"></span>
+    </p>
+  </footer>
+
+  <script src="scatter.js"></script>
+</body>
+</html>
